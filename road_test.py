@@ -10,29 +10,93 @@ HOST = "http://192.168.4.1:8000"
 
 
 # =========================================================
-# 모터 명령
+# 주행 설정
+# =========================================================
+BASE_SPEED = 25
+
+# GitHub 공개코드의 P제어 개념 참고
+KP = 0.12
+
+MAX_SPEED = 40
+
+# 중심선을 잃었을 때 탐색 속도
+SEARCH_SPEED = 18
+
+
+# =========================================================
+# 영상 처리 설정
+# =========================================================
+ROI_START_RATIO = 0.58
+
+LOWER_WHITE = np.array([0, 0, 175])
+UPPER_WHITE = np.array([180, 75, 255])
+
+MIN_AREA = 500
+
+STEP = 15
+MIN_WIDTH = 25
+MAX_JUMP = 60
+MAX_POINTS = 8
+
+
+# =========================================================
+# 교차로 설정
+#
+# 직선 약 0.87
+# 교차로 약 0.95
+# =========================================================
+
+# 교차로 진입 기준
+INTERSECTION_ENTER = 0.93
+
+# 교차로 탈출 기준
+INTERSECTION_EXIT = 0.90
+
+intersection_count = 0
+intersection_locked = False
+
+clear_counter = 0
+CLEAR_FRAMES = 10
+
+
+# =========================================================
+# 자동주행 상태
+# =========================================================
+auto_mode = False
+
+last_error = 0
+
+
+# =========================================================
+# Pinky 모터 명령
 # =========================================================
 def drive(left, right):
+
+    left = int(np.clip(left, -100, 100))
+    right = int(np.clip(right, -100, 100))
+
     try:
         requests.post(
             HOST + "/drive",
             json={
-                "l": int(left),
-                "r": int(right)
+                "l": left,
+                "r": right
             },
             timeout=0.3
         )
+
     except requests.RequestException:
         pass
 
 
 def stop():
+
     try:
         requests.post(
             HOST + "/stop",
-            json={},
             timeout=0.3
         )
+
     except requests.RequestException:
         pass
 
@@ -40,40 +104,31 @@ def stop():
 # =========================================================
 # 카메라 연결
 # =========================================================
-cap = cv2.VideoCapture(HOST + "/video")
+cap = cv2.VideoCapture(
+    HOST + "/video"
+)
 
 if not cap.isOpened():
-    print("로봇 카메라 연결 실패")
+
+    print("카메라 연결 실패")
     exit()
 
 
-# =========================================================
-# 교차로 관련 변수
-# =========================================================
-intersection_count = 0
-
-# 같은 교차로를 여러 번 세지 않도록 잠금
-intersection_locked = False
-
-# 교차로에서 완전히 빠져나왔는지 확인
-clear_counter = 0
-
-# 연속 일반도로 프레임 수
-CLEAR_FRAMES = 10
-
-
 print("""
-==================================
-Pinky Pro Road Test
-==================================
+================================
+Pinky Pro Centerline Follower
+================================
 
-W : 전진
-S : 후진
-A : 좌회전
-D : 우회전
+P       : AUTO ON / OFF
 
-SPACE : 정지
-ESC : 종료
+W       : 수동 전진
+S       : 수동 후진
+A       : 수동 좌회전
+D       : 수동 우회전
+
+SPACE   : 정지
+R       : 교차로 카운트 초기화
+ESC     : 종료
 """)
 
 
@@ -85,7 +140,7 @@ while True:
     ret, frame = cap.read()
 
     if not ret:
-        print("카메라 영상 수신 실패")
+        print("영상 수신 실패")
         break
 
 
@@ -93,12 +148,11 @@ while True:
 
 
     # =====================================================
-    # 1. ROI 설정
-    #
-    # 카메라가 위쪽을 많이 보기 때문에
-    # 아래쪽 42%만 사용
+    # 1. ROI
     # =====================================================
-    roi_start = int(h * 0.58)
+    roi_start = int(
+        h * ROI_START_RATIO
+    )
 
     roi = frame[
         roi_start:h,
@@ -107,7 +161,7 @@ while True:
 
 
     # =====================================================
-    # 2. Gaussian Blur
+    # 2. 노이즈 완화
     # =====================================================
     roi_blur = cv2.GaussianBlur(
         roi,
@@ -126,20 +180,12 @@ while True:
 
 
     # =====================================================
-    # 4. 흰색 도로 검출
+    # 4. 흰색 도로 이진화
     # =====================================================
-    lower_white = np.array(
-        [0, 0, 175]
-    )
-
-    upper_white = np.array(
-        [180, 75, 255]
-    )
-
     mask = cv2.inRange(
         hsv,
-        lower_white,
-        upper_white
+        LOWER_WHITE,
+        UPPER_WHITE
     )
 
 
@@ -160,7 +206,7 @@ while True:
 
 
     # =====================================================
-    # 6. 도로 내부 글씨 / 검은 틈 메우기
+    # 6. 도로 내부 글씨/틈 메우기
     # =====================================================
     kernel_close = np.ones(
         (17, 17),
@@ -187,9 +233,11 @@ while True:
 
     cleaned_mask = np.zeros_like(mask)
 
-    MIN_AREA = 500
 
-    for i in range(1, num_labels):
+    for i in range(
+        1,
+        num_labels
+    ):
 
         area = stats[
             i,
@@ -197,42 +245,57 @@ while True:
         ]
 
         if area >= MIN_AREA:
+
             cleaned_mask[
                 labels == i
             ] = 255
+
 
     mask = cleaned_mask
 
 
     # =====================================================
-    # 8. 교차로 감지용 White Ratio
+    # 8. 교차로 감지
     #
-    # 중요:
-    # 여기서는 아직 1번 교차로 오른쪽을 자르기 전 mask를 사용
+    # 흰색 영역 비율
     # =====================================================
-    white_pixels = cv2.countNonZero(mask)
-
-    total_pixels = mask.size
-
     white_ratio = (
-        white_pixels
-        / total_pixels
+        cv2.countNonZero(mask)
+        / mask.size
     )
 
 
-    # 실제 경기장에서 나중에 조정
-    INTERSECTION_RATIO = 0.68
+    # =====================================================
+    # 교차로 진입 / 탈출 기준을 다르게 설정
+    #
+    # 일반도로:
+    # 0.87 정도
+    #
+    # 교차로:
+    # 0.95 정도
+    # =====================================================
+    if intersection_locked:
 
-    is_intersection = (
-        white_ratio > INTERSECTION_RATIO
-    )
+        # 이미 교차로라면
+        # 0.90 아래로 내려갈 때까지 유지
+        is_intersection = (
+            white_ratio
+            > INTERSECTION_EXIT
+        )
+
+    else:
+
+        # 일반도로에서는
+        # 0.93 이상이 되어야 교차로 진입
+        is_intersection = (
+            white_ratio
+            > INTERSECTION_ENTER
+        )
 
 
     # =====================================================
     # 9. 교차로 카운트
     # =====================================================
-
-    # 새로운 교차로 진입
     if (
         is_intersection
         and not intersection_locked
@@ -250,15 +313,16 @@ while True:
 
 
     # =====================================================
-    # 교차로에서 빠져나왔는지 확인
+    # 교차로 탈출 확인
     # =====================================================
     if not is_intersection:
 
         clear_counter += 1
 
-        # 일정 프레임 동안 일반도로가 나오면
-        # 다음 교차로를 인식할 수 있게 잠금 해제
-        if clear_counter >= CLEAR_FRAMES:
+        if (
+            clear_counter
+            >= CLEAR_FRAMES
+        ):
 
             intersection_locked = False
 
@@ -270,7 +334,7 @@ while True:
 
 
     # =====================================================
-    # 10. 중심선 계산용 Mask 따로 복사
+    # 10. 중심선 계산용 mask
     # =====================================================
     tracking_mask = mask.copy()
 
@@ -278,11 +342,7 @@ while True:
     # =====================================================
     # 11. 1번 교차로 직진 보정
     #
-    # 1번 교차로에서는 오른쪽으로 갈라지는 흰색 도로를
-    # 중심선 계산에서 제외
-    #
-    # 교차로 감지 자체는 원래 mask로 이미 끝났기 때문에
-    # tracking_mask만 수정함
+    # 오른쪽 갈림길 무시
     # =====================================================
     if (
         intersection_count == 1
@@ -290,7 +350,7 @@ while True:
     ):
 
         cut_x = int(
-            tracking_mask.shape[1] * 0.72
+            w * 0.72
         )
 
         tracking_mask[
@@ -300,26 +360,17 @@ while True:
 
 
     # =====================================================
-    # 12. 중심선 계산
+    # 12. 중심점 계산
     # =====================================================
-    roi_h, roi_w = tracking_mask.shape
+    roi_h, roi_w = (
+        tracking_mask.shape
+    )
 
     center_points = []
-
-    STEP = 15
-
-    MIN_WIDTH = 25
-
-    # 중심점이 갑자기 튀는 것 제한
-    MAX_JUMP = 60
-
-    # 가까운 도로만 사용
-    MAX_POINTS = 8
 
     prev_center = None
 
 
-    # 아래쪽부터 위쪽으로 검색
     for y in range(
         roi_h - 1,
         0,
@@ -330,14 +381,12 @@ while True:
             tracking_mask[y] == 255
         )[0]
 
+
         if len(xs) == 0:
             continue
 
 
-        # =================================================
-        # 한 줄에 흰색 영역이 여러 개 있을 수 있으므로
-        # 연속된 그룹으로 분리
-        # =================================================
+        # 흰색 영역 분리
         groups = np.split(
             xs,
             np.where(
@@ -346,21 +395,20 @@ while True:
         )
 
 
-        # 너무 작은 흰색 영역 제거
+        # 너무 작은 영역 제거
         groups = [
             g
             for g in groups
             if len(g) >= MIN_WIDTH
         ]
 
+
         if len(groups) == 0:
             continue
 
 
         # =================================================
-        # 첫 번째 중심점
-        #
-        # 화면 중앙에 가장 가까운 도로 선택
+        # 첫 중심점
         # =================================================
         if prev_center is None:
 
@@ -378,27 +426,20 @@ while True:
 
 
         # =================================================
-        # 두 번째 이후
-        #
-        # 곡선일 경우 이전 중심점 이동 방향을 보고
-        # 다음 중심 위치를 예상
+        # 곡선 예측
         # =================================================
         else:
 
             predicted_x = prev_center
 
 
-            # 중심점이 2개 이상 있으면
-            # 최근 방향으로 다음 위치 예상
             if len(center_points) >= 2:
 
                 x1 = center_points[-2][0]
-
                 x2 = center_points[-1][0]
 
                 dx = x2 - x1
 
-                # 너무 크게 예측하지 않도록 제한
                 dx = int(
                     np.clip(
                         dx,
@@ -407,10 +448,11 @@ while True:
                     )
                 )
 
-                predicted_x = x2 + dx
+                predicted_x = (
+                    x2 + dx
+                )
 
 
-            # 예상 위치와 가장 가까운 흰색 영역 선택
             chosen = min(
                 groups,
                 key=lambda g:
@@ -425,7 +467,6 @@ while True:
 
 
         x_left = chosen[0]
-
         x_right = chosen[-1]
 
         x_center = (
@@ -433,13 +474,12 @@ while True:
         ) // 2
 
 
-        # =================================================
-        # 갑자기 다른 도로로 튀는 것 방지
-        # =================================================
+        # 갑자기 다른 영역으로 튀는 것 방지
         if prev_center is not None:
 
             if abs(
-                x_center - prev_center
+                x_center
+                - prev_center
             ) > MAX_JUMP:
 
                 continue
@@ -461,17 +501,16 @@ while True:
         prev_center = x_center
 
 
-        # 가까운 도로만 사용
-        if len(center_points) >= MAX_POINTS:
+        if (
+            len(center_points)
+            >= MAX_POINTS
+        ):
+
             break
 
 
     # =====================================================
-    # 13. 곡선 도로 보정
-    #
-    # 중심점들을 2차 곡선으로 fitting
-    # 직선이면 거의 직선으로,
-    # 원형/곡선이면 부드러운 곡선으로 만들어줌
+    # 13. 곡선 도로 2차 fitting
     # =====================================================
     if len(center_points) >= 5:
 
@@ -494,7 +533,6 @@ while True:
             )
 
 
-            # x = a*y^2 + b*y + c
             coeff = np.polyfit(
                 ys,
                 xs,
@@ -519,7 +557,6 @@ while True:
                 )
 
 
-                # 화면 밖으로 나가지 않도록 제한
                 x_value = np.clip(
                     x_value,
                     0,
@@ -539,13 +576,12 @@ while True:
 
 
         except Exception:
-            # fitting에 문제가 있으면
-            # 원래 중심점 사용
+
             pass
 
 
     # =====================================================
-    # 14. 결과 영상
+    # 14. 결과 화면
     # =====================================================
     result = frame.copy()
 
@@ -563,49 +599,14 @@ while True:
     # 카메라 중앙선
     cv2.line(
         result,
-        (w // 2, h),
         (w // 2, roi_start),
+        (w // 2, h),
         (0, 255, 0),
         2
     )
 
 
-    # =====================================================
-    # 1번 교차로에서 오른쪽 무시 영역 표시
-    # =====================================================
-    if (
-        intersection_count == 1
-        and intersection_locked
-    ):
-
-        cut_x_display = int(
-            w * 0.72
-        )
-
-        cv2.line(
-            result,
-            (cut_x_display, roi_start),
-            (cut_x_display, h),
-            (0, 165, 255),
-            2
-        )
-
-
-        cv2.putText(
-            result,
-            "IGNORE RIGHT AREA",
-            (max(10, cut_x_display - 190),
-             roi_start + 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 165, 255),
-            2
-        )
-
-
-    # =====================================================
-    # 중심점 표시
-    # =====================================================
+    # 중심점
     for x, y in center_points:
 
         cv2.circle(
@@ -617,9 +618,7 @@ while True:
         )
 
 
-    # =====================================================
-    # 중심선 표시
-    # =====================================================
+    # 중심선
     for i in range(
         len(center_points) - 1
     ):
@@ -634,12 +633,12 @@ while True:
 
 
     # =====================================================
-    # 15. 일반 도로 또는 1번 교차로
-    #
-    # 1번 교차로는 직진해야 하므로
-    # 보정된 중심선을 계속 사용
+    # 15. Center Error 계산
     # =====================================================
-    allow_center_tracking = (
+    error = None
+
+
+    allow_tracking = (
         not is_intersection
         or intersection_count == 1
     )
@@ -647,18 +646,18 @@ while True:
 
     if (
         len(center_points) >= 3
-        and allow_center_tracking
+        and allow_tracking
     ):
 
-        # 아래에서 세 번째 점을 목표점으로 사용
         target_index = min(
             2,
             len(center_points) - 1
         )
 
-
         target_x, target_y = (
-            center_points[target_index]
+            center_points[
+                target_index
+            ]
         )
 
 
@@ -666,6 +665,9 @@ while True:
             target_x
             - w // 2
         )
+
+
+        last_error = error
 
 
         # 목표점
@@ -686,40 +688,120 @@ while True:
             f"Center Error: {error}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
+            0.7,
             (0, 0, 255),
             2
         )
 
 
     # =====================================================
-    # 16. 교차로별 안내
+    # 16. 자동 중심선 추종
+    # =====================================================
+    if auto_mode:
+
+        # =================================================
+        # 2번 / 3번 교차로
+        #
+        # 현재 코드에서는 우선 정지
+        # =================================================
+        if (
+            is_intersection
+            and intersection_count in [2, 3]
+        ):
+
+            stop()
+
+
+        # =================================================
+        # 정상 중심선 발견
+        # =================================================
+        elif error is not None:
+
+            correction = (
+                KP * error
+            )
+
+
+            left_speed = (
+                BASE_SPEED
+                + correction
+            )
+
+            right_speed = (
+                BASE_SPEED
+                - correction
+            )
+
+
+            left_speed = np.clip(
+                left_speed,
+                0,
+                MAX_SPEED
+            )
+
+            right_speed = np.clip(
+                right_speed,
+                0,
+                MAX_SPEED
+            )
+
+
+            drive(
+                left_speed,
+                right_speed
+            )
+
+
+        # =================================================
+        # 중심선을 잃었을 경우
+        # =================================================
+        else:
+
+            if last_error < 0:
+
+                # 왼쪽에서 마지막으로 봄
+                drive(
+                    0,
+                    SEARCH_SPEED
+                )
+
+
+            elif last_error > 0:
+
+                # 오른쪽에서 마지막으로 봄
+                drive(
+                    SEARCH_SPEED,
+                    0
+                )
+
+
+            else:
+
+                stop()
+
+
+    # =====================================================
+    # 17. 교차로 메시지
     # =====================================================
     if is_intersection:
 
-        # 1번 교차로
         if intersection_count == 1:
 
             message = (
-                "INTERSECTION 1 - GO STRAIGHT"
+                "INTERSECTION 1 - STRAIGHT"
             )
 
-
-        # 2번 교차로
         elif intersection_count == 2:
 
             message = (
-                "INTERSECTION 2 - TURN RIGHT"
+                "INTERSECTION 2 - RIGHT"
             )
 
-
-        # 3번 교차로
         elif intersection_count == 3:
 
             message = (
-                "INTERSECTION 3 - TURN RIGHT"
+                "INTERSECTION 3 - RIGHT"
             )
-
 
         else:
 
@@ -733,21 +815,39 @@ while True:
             message,
             (20, 75),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
+            0.58,
             (0, 0, 255),
             2
         )
 
 
     # =====================================================
-    # 17. 상태 표시
+    # 18. 상태 표시
     # =====================================================
+    mode_text = (
+        "AUTO"
+        if auto_mode
+        else "MANUAL"
+    )
+
+
     cv2.putText(
         result,
-        f"Intersection count: {intersection_count}",
-        (20, 110),
+        f"MODE: {mode_text}",
+        (20, 105),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
+        0.6,
+        (255, 0, 0),
+        2
+    )
+
+
+    cv2.putText(
+        result,
+        f"Intersection: {intersection_count}",
+        (20, 135),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
         (255, 0, 0),
         2
     )
@@ -756,22 +856,21 @@ while True:
     cv2.putText(
         result,
         f"White ratio: {white_ratio:.2f}",
-        (20, 140),
+        (20, 165),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
+        0.5,
         (255, 0, 0),
         2
     )
 
 
     # =====================================================
-    # 18. 화면 출력
+    # 19. 영상 출력
     # =====================================================
     cv2.imshow(
         "Pinky Centerline",
         result
     )
-
 
     cv2.imshow(
         "Road Mask",
@@ -780,52 +879,100 @@ while True:
 
 
     # =====================================================
-    # 19. 키보드 수동 주행
+    # 20. 키보드
     # =====================================================
     key = cv2.waitKey(1) & 0xFF
 
 
-    # W = 전진
-    if key == ord("w"):
+    # AUTO ON/OFF
+    if key == ord("p"):
 
-        drive(30, 30)
+        auto_mode = not auto_mode
+
+        stop()
+
+        print(
+            "AUTO ON"
+            if auto_mode
+            else "AUTO OFF"
+        )
+
+
+    # 수동 전진
+    elif key == ord("w"):
+
+        auto_mode = False
+
+        drive(
+            30,
+            30
+        )
 
         print("FORWARD")
 
 
-    # S = 후진
+    # 수동 후진
     elif key == ord("s"):
 
-        drive(-30, -30)
+        auto_mode = False
+
+        drive(
+            -30,
+            -30
+        )
 
         print("BACKWARD")
 
 
-    # A = 좌회전
+    # 수동 좌회전
     elif key == ord("a"):
 
-        drive(-25, 25)
+        auto_mode = False
+
+        drive(
+            -25,
+            25
+        )
 
         print("LEFT")
 
 
-    # D = 우회전
+    # 수동 우회전
     elif key == ord("d"):
 
-        drive(25, -25)
+        auto_mode = False
+
+        drive(
+            25,
+            -25
+        )
 
         print("RIGHT")
 
 
-    # SPACE = 정지
+    # 긴급 정지
     elif key == 32:
+
+        auto_mode = False
 
         stop()
 
         print("STOP")
 
 
-    # ESC = 종료
+    # 교차로 번호 초기화
+    elif key == ord("r"):
+
+        intersection_count = 0
+        intersection_locked = False
+        clear_counter = 0
+
+        print(
+            "INTERSECTION RESET"
+        )
+
+
+    # 종료
     elif key == 27:
 
         stop()
@@ -843,3 +990,4 @@ cap.release()
 cv2.destroyAllWindows()
 
 print("종료")
+
