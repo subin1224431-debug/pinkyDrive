@@ -1,123 +1,189 @@
+# =========================================================
+# 주행 로직 전용 코드
+#
+# 전제:
+#   - Raspberry Pi 환경/카메라/모터는 이미 구현되어 있음
+#   - 아래 객체/함수는 기존 코드에 이미 존재한다고 가정
+#
+#       cap.read()          -> ret, frame
+#       drive(left, right)  -> 모터 구동
+#       stop()              -> 정지
+#
+# 이 코드에서는 pinkylib / HOST / requests / 서버 설정을 만들지 않음.
+# =========================================================
+
 import cv2
+import numpy as np
 import time
-from pathlib import Path
-from pinkylib import Camera, Motor
 
 
 # =========================================================
-# Pinky Pro - Raspberry Pi 내부 실행용
+# 1. 주행 설정
+# =========================================================
+DRIVE_SPEED = 23
+TURN_SPEED = 22
+
+# "멈춘 다음 회전/출발"을 확실히 하기 위한 짧은 대기
+STOP_PAUSE = 0.35
+
+# 상태가 바뀐 직후 이전 표식을 다시 잡는 것 방지
+STATE_IGNORE_TIME = 0.60
+
+# Raspberry Pi 부하 감소:
+# 2프레임마다 한 번만 표식 확인
+DETECT_EVERY_N_FRAMES = 2
+
+
+# =========================================================
+# 2. 표식 인식 설정
 #
-# 노트북은 SSH만 사용.
-# requests / HOST / HTTP server 사용하지 않음.
+# 가장 단순한 OpenCV template matching 사용.
+# 복잡한 YOLO/OCR 없음.
 #
-# 필요한 템플릿 이미지(이 파일과 같은 폴더):
+# 이 코드 파일과 같은 폴더 또는 아래 경로에
+# 다음 이미지가 있어야 함.
+#
 #   arrow_normal.png
 #   arrow_reverse.png
 #   stop.png
 #   station.png
 #   goal.png
 #
-# 각 이미지는 로봇 카메라 화면에서 해당 표식만
-# 최대한 타이트하게 잘라 저장한 이미지로 준비.
+# 실제 로봇 카메라 화면에서 해당 표식만 잘라 저장하면 됨.
 # =========================================================
-
-
-# =========================================================
-# 1. 주행 속도
-# =========================================================
-DRIVE_SPEED = 23
-TURN_SPEED = 22
-
-# 반드시 "정지 → 회전/출발" 순서를 만들기 위한 대기
-STOP_PAUSE = 0.40
-
-# CPU 부하를 줄이기 위해 N프레임마다 표식 검사
-DETECT_EVERY_N_FRAMES = 2
-
-# 상태가 바뀐 직후 같은 표식을 다시 잡는 것 방지
-IGNORE_AFTER_STATE_CHANGE = 0.60
-
-
-# =========================================================
-# 2. Template Matching 기준
-#
-# 실제 카메라에서 score를 보고 조금씩 조정 가능.
-# 너무 안 잡히면 0.72 -> 0.65 정도로 낮춘다.
-# 오검출이 많으면 값을 높인다.
-# =========================================================
-THRESHOLDS = {
-    "arrow_normal": 0.72,
-    "arrow_reverse": 0.72,
-    "stop": 0.70,
-    "station": 0.70,
-    "goal": 0.70,
+TEMPLATE_PATHS = {
+    "ARROW_NORMAL": "arrow_normal.png",
+    "ARROW_REVERSE": "arrow_reverse.png",
+    "STOP": "stop.png",
+    "STATION": "station.png",
+    "GOAL": "goal.png",
 }
 
-# 연속 몇 번 보여야 진짜 표식으로 확정할지
-STABLE_ON_FRAMES = 3
+MATCH_THRESHOLD = {
+    "ARROW_NORMAL": 0.68,
+    "ARROW_REVERSE": 0.68,
+    "STOP": 0.68,
+    "STATION": 0.68,
+    "GOAL": 0.68,
+}
 
-# 연속 몇 번 안 보여야 화면에서 사라졌다고 확정할지
-STABLE_OFF_FRAMES = 4
+# 한 프레임만 우연히 잡힌 것은 무시
+ON_FRAMES = 3
 
-# 첫 번째/두 번째 화살표를 같은 화살표로 중복 카운트하지 않도록
-ARROW_EVENT_COOLDOWN = 1.5
-
-
-# =========================================================
-# 3. 상태 이름
-# =========================================================
-FIRST_STRAIGHT = "FIRST_STRAIGHT"
-
-TURN_TO_STOP_1 = "TURN_TO_STOP_1"
-
-DRIVE_TO_ARROW_STATION = "DRIVE_TO_ARROW_STATION"
-TURN_TO_STATION = "TURN_TO_STATION"
-
-DRIVE_TO_ARROW_STOP = "DRIVE_TO_ARROW_STOP"
-TURN_TO_STOP_2 = "TURN_TO_STOP_2"
-
-DRIVE_TO_REVERSE_ARROW = "DRIVE_TO_REVERSE_ARROW"
-TURN_TO_NORMAL_ARROW = "TURN_TO_NORMAL_ARROW"
-
-DRIVE_TO_GOAL = "DRIVE_TO_GOAL"
-
-DONE = "DONE"
+# 화면에서 사라졌다고 판단할 연속 미검출 프레임 수
+OFF_FRAMES = 4
 
 
 # =========================================================
-# 4. 표식 안정화 클래스
+# 3. 템플릿 불러오기
+# =========================================================
+templates = {}
+
+for name, path in TEMPLATE_PATHS.items():
+
+    img = cv2.imread(
+        path,
+        cv2.IMREAD_GRAYSCALE
+    )
+
+    if img is None:
+        raise FileNotFoundError(
+            f"{path} 파일을 찾을 수 없습니다."
+        )
+
+    templates[name] = img
+
+
+# =========================================================
+# 4. 가벼운 표식 인식
 #
-# 한 프레임만 잠깐 잡혔다고 바로 판단하지 않고
-# 몇 프레임 연속 보여야 "등장",
-# 몇 프레임 연속 안 보여야 "사라짐" 처리.
+# 현재 상태에서 필요한 표식 1개만 검사함.
+# 크기가 약간 달라져도 잡도록 3개 scale만 확인.
 # =========================================================
-class StablePresence:
+def template_score(frame, template):
 
-    def __init__(
-        self,
-        on_frames=STABLE_ON_FRAMES,
-        off_frames=STABLE_OFF_FRAMES
-    ):
-        self.on_frames = on_frames
-        self.off_frames = off_frames
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    # 연산량 감소
+    h, w = gray.shape[:2]
+
+    if w > 640:
+        scale_down = 640.0 / w
+
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=scale_down,
+            fy=scale_down
+        )
+
+    best_score = 0.0
+
+    for scale in (0.80, 1.00, 1.20):
+
+        resized_template = cv2.resize(
+            template,
+            None,
+            fx=scale,
+            fy=scale
+        )
+
+        th, tw = resized_template.shape[:2]
+        fh, fw = gray.shape[:2]
+
+        if (
+            th < 8
+            or tw < 8
+            or th >= fh
+            or tw >= fw
+        ):
+            continue
+
+        result = cv2.matchTemplate(
+            gray,
+            resized_template,
+            cv2.TM_CCOEFF_NORMED
+        )
+
+        _, score, _, _ = cv2.minMaxLoc(
+            result
+        )
+
+        if score > best_score:
+            best_score = float(score)
+
+    return best_score
+
+
+# =========================================================
+# 5. 표식이 실제로 등장/사라졌는지 안정적으로 확인
+# =========================================================
+class StableDetector:
+
+    def __init__(self):
+
+        self.active = False
 
         self.on_count = 0
         self.off_count = 0
-
-        self.active = False
 
 
     def reset(self):
 
+        self.active = False
+
         self.on_count = 0
         self.off_count = 0
-        self.active = False
 
 
     def update(self, detected):
 
-        event = None
-
+        # ---------------------------------------------
+        # 표식이 보임
+        # ---------------------------------------------
         if detected:
 
             self.on_count += 1
@@ -125,11 +191,17 @@ class StablePresence:
 
             if (
                 not self.active
-                and self.on_count >= self.on_frames
+                and self.on_count >= ON_FRAMES
             ):
-                self.active = True
-                event = "rise"
 
+                self.active = True
+
+                return "RISE"
+
+
+        # ---------------------------------------------
+        # 표식이 안 보임
+        # ---------------------------------------------
         else:
 
             self.off_count += 1
@@ -137,214 +209,137 @@ class StablePresence:
 
             if (
                 self.active
-                and self.off_count >= self.off_frames
+                and self.off_count >= OFF_FRAMES
             ):
+
                 self.active = False
-                event = "fall"
 
-        return event
-
-
-# =========================================================
-# 5. Template 읽기
-# =========================================================
-BASE_DIR = Path(__file__).resolve().parent
-
-TEMPLATE_FILES = {
-    "arrow_normal": "arrow_normal.png",
-    "arrow_reverse": "arrow_reverse.png",
-    "stop": "stop.png",
-    "station": "station.png",
-    "goal": "goal.png",
-}
+                return "FALL"
 
 
-def load_templates():
-
-    result = {}
-
-    for name, filename in TEMPLATE_FILES.items():
-
-        path = BASE_DIR / filename
-
-        image = cv2.imread(
-            str(path),
-            cv2.IMREAD_GRAYSCALE
-        )
-
-        if image is None:
-
-            raise FileNotFoundError(
-                f"템플릿 파일 없음: {path}"
-            )
-
-        result[name] = image
-
-    return result
+        return None
 
 
-templates = load_templates()
+detector = StableDetector()
 
 
 # =========================================================
-# 6. 가벼운 Template Matching
-#
-# 현재 상태에서 필요한 표식 1개만 검사하므로
-# 모든 표식을 동시에 찾는 것보다 Raspberry Pi 부담이 작음.
+# 6. 상태 정의
 # =========================================================
-def template_score(gray_frame, template):
 
-    fh, fw = gray_frame.shape[:2]
-    th, tw = template.shape[:2]
+# 처음 직진하면서 정상 화살표 두 개 확인
+FIRST_STRAIGHT = "FIRST_STRAIGHT"
 
-    if (
-        fh < th
-        or fw < tw
-    ):
-        return 0.0
+# 두 번째 화살표가 사라진 뒤 우회전하며 STOP 찾기
+TURN_TO_FIRST_STOP = "TURN_TO_FIRST_STOP"
 
-    result = cv2.matchTemplate(
-        gray_frame,
-        template,
-        cv2.TM_CCOEFF_NORMED
-    )
+# STOP 이후 직진, 다음 화살표 찾기
+DRIVE_TO_STATION_ARROW = "DRIVE_TO_STATION_ARROW"
 
-    _, max_value, _, _ = cv2.minMaxLoc(
-        result
-    )
+# 화살표에서 멈춘 뒤 우회전하며 STATION 찾기
+TURN_TO_STATION = "TURN_TO_STATION"
 
-    return float(max_value)
+# STATION 이후 직진, 다음 화살표 찾기
+DRIVE_TO_STOP_ARROW = "DRIVE_TO_STOP_ARROW"
+
+# 화살표에서 멈춘 뒤 우회전하며 STOP 찾기
+TURN_TO_SECOND_STOP = "TURN_TO_SECOND_STOP"
+
+# STOP 이후 직진하며 반대방향 화살표 찾기
+DRIVE_TO_REVERSE_ARROW = "DRIVE_TO_REVERSE_ARROW"
+
+# 반대방향 화살표에서 우회전하며 정상 화살표 찾기
+TURN_TO_NORMAL_ARROW = "TURN_TO_NORMAL_ARROW"
+
+# 마지막 정상 화살표 이후 GOAL까지 직진
+DRIVE_TO_GOAL = "DRIVE_TO_GOAL"
+
+DONE = "DONE"
 
 
 # =========================================================
-# 7. 상태별로 지금 찾아야 하는 표식
+# 7. 상태별로 찾아야 하는 표식
 # =========================================================
 def target_for_state(state):
 
     if state == FIRST_STRAIGHT:
-        return "arrow_normal"
+        return "ARROW_NORMAL"
 
-    if state == TURN_TO_STOP_1:
-        return "stop"
+    if state == TURN_TO_FIRST_STOP:
+        return "STOP"
 
-    if state == DRIVE_TO_ARROW_STATION:
-        return "arrow_normal"
+    if state == DRIVE_TO_STATION_ARROW:
+        return "ARROW_NORMAL"
 
     if state == TURN_TO_STATION:
-        return "station"
+        return "STATION"
 
-    if state == DRIVE_TO_ARROW_STOP:
-        return "arrow_normal"
+    if state == DRIVE_TO_STOP_ARROW:
+        return "ARROW_NORMAL"
 
-    if state == TURN_TO_STOP_2:
-        return "stop"
+    if state == TURN_TO_SECOND_STOP:
+        return "STOP"
 
     if state == DRIVE_TO_REVERSE_ARROW:
-        return "arrow_reverse"
+        return "ARROW_REVERSE"
 
     if state == TURN_TO_NORMAL_ARROW:
-        return "arrow_normal"
+        return "ARROW_NORMAL"
 
     if state == DRIVE_TO_GOAL:
-        return "goal"
+        return "GOAL"
 
     return None
 
 
 # =========================================================
-# 8. Motor / Camera
-# =========================================================
-motor = Motor()
-camera = Camera()
-
-motor.enable_motor()
-camera.start()
-
-
-# =========================================================
-# 9. 주행 함수
-# =========================================================
-def straight():
-
-    motor.move(
-        DRIVE_SPEED,
-        DRIVE_SPEED
-    )
-
-
-def right_turn():
-
-    motor.move(
-        TURN_SPEED,
-        -TURN_SPEED
-    )
-
-
-def full_stop():
-
-    motor.stop()
-
-
-# =========================================================
-# 10. 정지 후 상태 변경
-#
-# 사용자가 말한 핵심:
-# "멈추고 오른쪽으로 회전"
-#
-# 회전하기 전에 항상 stop()부터 실행.
+# 8. 주행 상태 변수
 # =========================================================
 state = FIRST_STRAIGHT
-state_start_time = time.monotonic()
 
-presence = StablePresence()
+state_changed_time = time.monotonic()
 
 arrow_count = 0
 second_arrow_seen = False
-last_arrow_event_time = -999.0
+
+frame_count = 0
 
 
-def change_state(new_state, stop_first=True):
+# =========================================================
+# 9. 반드시 "멈춘 뒤" 상태 변경
+# =========================================================
+def change_state(new_state):
 
     global state
-    global state_start_time
+    global state_changed_time
 
-    if stop_first:
+    # ★ 핵심: 먼저 정지
+    stop()
 
-        full_stop()
-        time.sleep(STOP_PAUSE)
+    time.sleep(
+        STOP_PAUSE
+    )
 
     state = new_state
-    state_start_time = time.monotonic()
 
-    presence.reset()
+    state_changed_time = (
+        time.monotonic()
+    )
+
+    detector.reset()
 
     print(
-        f"\nSTATE -> {state}"
+        f"STATE -> {state}"
     )
 
 
 # =========================================================
-# 11. 시작
+# 10. 자율주행 시작
 # =========================================================
 print("")
-print("========================================")
-print(" Pinky Raspberry Pi Autonomous Sequence ")
-print("========================================")
-print("START")
-print("")
-print("1) 직진")
-print("2) 정상 화살표 2번째가 사라지면 정지 후 우회전")
-print("3) STOP 보이면 출발")
-print("4) 다음 화살표에서 정지 후 STATION까지 우회전")
-print("5) 다음 화살표에서 정지 후 STOP까지 우회전")
-print("6) 반대 화살표에서 정지 후 우회전")
-print("7) 정상 화살표가 보이면 직진")
-print("8) GOAL 보이면 정지")
-print("")
-
-
-frame_counter = 0
-last_status_print = 0.0
+print("==============================")
+print("AUTONOMOUS ROUTE START")
+print("==============================")
 
 
 try:
@@ -352,219 +347,226 @@ try:
     while True:
 
         # =================================================
-        # 카메라
+        # 카메라 프레임
         # =================================================
-        frame = camera.get_frame()
+        ret, frame = cap.read()
 
-        if frame is None:
+        if not ret:
 
-            time.sleep(0.02)
+            stop()
+
+            print(
+                "CAMERA FRAME ERROR"
+            )
+
+            time.sleep(0.05)
+
             continue
 
 
         # =================================================
-        # 현재 상태에 따라 모터 동작
+        # A. 현재 상태에 따른 기본 모터 동작
         # =================================================
+
+        # ---------------------------------------------
+        # 직진 상태
+        # ---------------------------------------------
         if state in (
             FIRST_STRAIGHT,
-            DRIVE_TO_ARROW_STATION,
-            DRIVE_TO_ARROW_STOP,
+            DRIVE_TO_STATION_ARROW,
+            DRIVE_TO_STOP_ARROW,
             DRIVE_TO_REVERSE_ARROW,
             DRIVE_TO_GOAL
         ):
 
-            straight()
+            drive(
+                DRIVE_SPEED,
+                DRIVE_SPEED
+            )
 
 
+        # ---------------------------------------------
+        # 오른쪽 회전 상태
+        # ---------------------------------------------
         elif state in (
-            TURN_TO_STOP_1,
+            TURN_TO_FIRST_STOP,
             TURN_TO_STATION,
-            TURN_TO_STOP_2,
+            TURN_TO_SECOND_STOP,
             TURN_TO_NORMAL_ARROW
         ):
 
-            right_turn()
+            drive(
+                TURN_SPEED,
+                -TURN_SPEED
+            )
 
 
+        # ---------------------------------------------
+        # 도착
+        # ---------------------------------------------
         elif state == DONE:
 
-            full_stop()
-            print("GOAL COMPLETE")
+            stop()
+
+            print(
+                "GOAL COMPLETE"
+            )
+
             break
 
 
         # =================================================
-        # CPU 부담 감소
+        # B. Raspberry Pi 연산량 줄이기
         # =================================================
-        frame_counter += 1
+        frame_count += 1
 
         if (
-            frame_counter
+            frame_count
             % DETECT_EVERY_N_FRAMES
             != 0
         ):
-            time.sleep(0.01)
+
             continue
 
 
-        # 상태 변경 직후에는 잠깐 검출 무시
+        # 상태가 막 바뀌었으면
+        # 이전 표식을 바로 다시 잡지 않도록 잠깐 무시
         if (
             time.monotonic()
-            - state_start_time
-            < IGNORE_AFTER_STATE_CHANGE
+            - state_changed_time
+            < STATE_IGNORE_TIME
         ):
-            time.sleep(0.01)
+
             continue
 
 
         # =================================================
-        # 현재 상태에서 필요한 표식만 찾음
+        # C. 현재 필요한 표식 하나만 검사
         # =================================================
         target = target_for_state(
             state
         )
 
         if target is None:
-
-            time.sleep(0.01)
             continue
 
 
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
-
-
         score = template_score(
-            gray,
+            frame,
             templates[target]
         )
 
 
         detected = (
             score
-            >= THRESHOLDS[target]
+            >= MATCH_THRESHOLD[target]
         )
 
 
-        event = presence.update(
+        event = detector.update(
             detected
         )
 
 
-        # 1초에 한 번 상태 / score 출력
-        now = time.monotonic()
-
-        if (
-            now
-            - last_status_print
-            >= 1.0
-        ):
-
-            print(
-                f"[{state}] "
-                f"target={target} "
-                f"score={score:.2f}"
-            )
-
-            last_status_print = now
+        # 필요하면 SSH 터미널에서 현재 값 확인 가능
+        print(
+            f"\r"
+            f"{state} | "
+            f"{target}: {score:.2f}",
+            end=""
+        )
 
 
         # =================================================
-        # 12. 첫 직선 구간
+        # 11. 처음 직진
         #
-        # 정상 화살표 등장 이벤트를 2번 카운트.
-        # 두 번째 화살표가 화면에서 사라지는 순간:
+        # 정상 화살표를 두 번 봄.
+        # 두 번째 화살표가 카메라에서 완전히 사라지면:
         #
-        # STOP -> RIGHT TURN
+        # STOP -> 우회전
         # =================================================
         if state == FIRST_STRAIGHT:
 
-            if event == "rise":
+            # 화살표 등장
+            if event == "RISE":
 
-                if (
-                    now
-                    - last_arrow_event_time
-                    >= ARROW_EVENT_COOLDOWN
-                ):
+                arrow_count += 1
 
-                    arrow_count += 1
-                    last_arrow_event_time = now
+                print(
+                    f"\nARROW COUNT = "
+                    f"{arrow_count}"
+                )
+
+
+                if arrow_count == 2:
+
+                    second_arrow_seen = True
 
                     print(
-                        f"NORMAL ARROW COUNT = "
-                        f"{arrow_count}"
+                        "SECOND ARROW SEEN"
                     )
 
 
-                    if arrow_count >= 2:
-
-                        second_arrow_seen = True
-
-                        print(
-                            "SECOND ARROW SEEN"
-                        )
-
-
+            # 두 번째 화살표가 사라짐
             elif (
-                event == "fall"
+                event == "FALL"
                 and second_arrow_seen
             ):
 
                 print(
-                    "SECOND ARROW DISAPPEARED"
+                    "\nSECOND ARROW DISAPPEARED"
                 )
 
                 print(
                     "STOP -> RIGHT TURN"
                 )
 
+
                 change_state(
-                    TURN_TO_STOP_1
+                    TURN_TO_FIRST_STOP
                 )
 
 
         # =================================================
-        # 13. 첫 우회전
+        # 12. 첫 번째 우회전
         #
         # STOP 글씨가 보일 때까지 회전.
-        # STOP 보이면 회전 정지 후 출발.
+        #
+        # STOP이 보이면:
+        # 회전 정지 -> 직진
         # =================================================
-        elif state == TURN_TO_STOP_1:
+        elif state == TURN_TO_FIRST_STOP:
 
-            if event == "rise":
-
-                print(
-                    "STOP FOUND"
-                )
+            if event == "RISE":
 
                 print(
-                    "STOP TURN -> GO STRAIGHT"
+                    "\nSTOP FOUND"
                 )
+
 
                 change_state(
-                    DRIVE_TO_ARROW_STATION
+                    DRIVE_TO_STATION_ARROW
                 )
 
 
         # =================================================
-        # 14. 다음 화살표
+        # 13. 다음 화살표
         #
         # 화살표가 보이면:
-        # STOP -> RIGHT TURN
+        # 정지 -> 오른쪽 회전
         # =================================================
-        elif state == DRIVE_TO_ARROW_STATION:
+        elif state == DRIVE_TO_STATION_ARROW:
 
-            if event == "rise":
+            if event == "RISE":
 
                 print(
-                    "ARROW FOUND"
+                    "\nARROW FOUND"
                 )
 
                 print(
                     "STOP -> TURN TO STATION"
                 )
+
 
                 change_state(
                     TURN_TO_STATION
@@ -572,62 +574,57 @@ try:
 
 
         # =================================================
-        # 15. STATION 글씨까지 우회전
+        # 14. STATION 보일 때까지 회전
         # =================================================
         elif state == TURN_TO_STATION:
 
-            if event == "rise":
+            if event == "RISE":
 
                 print(
-                    "STATION FOUND"
+                    "\nSTATION FOUND"
                 )
 
-                print(
-                    "STOP TURN -> GO STRAIGHT"
-                )
 
                 change_state(
-                    DRIVE_TO_ARROW_STOP
+                    DRIVE_TO_STOP_ARROW
                 )
 
 
         # =================================================
-        # 16. 그 다음 화살표
+        # 15. 다음 화살표
         #
         # 화살표가 보이면:
-        # STOP -> RIGHT TURN
+        # 정지 -> 오른쪽 회전
         # =================================================
-        elif state == DRIVE_TO_ARROW_STOP:
+        elif state == DRIVE_TO_STOP_ARROW:
 
-            if event == "rise":
+            if event == "RISE":
 
                 print(
-                    "ARROW FOUND"
+                    "\nARROW FOUND"
                 )
 
                 print(
                     "STOP -> TURN TO STOP SIGN"
                 )
 
+
                 change_state(
-                    TURN_TO_STOP_2
+                    TURN_TO_SECOND_STOP
                 )
 
 
         # =================================================
-        # 17. STOP 글씨까지 우회전
+        # 16. STOP 글씨 보일 때까지 회전
         # =================================================
-        elif state == TURN_TO_STOP_2:
+        elif state == TURN_TO_SECOND_STOP:
 
-            if event == "rise":
-
-                print(
-                    "STOP FOUND"
-                )
+            if event == "RISE":
 
                 print(
-                    "STOP TURN -> GO STRAIGHT"
+                    "\nSTOP FOUND"
                 )
+
 
                 change_state(
                     DRIVE_TO_REVERSE_ARROW
@@ -635,22 +632,23 @@ try:
 
 
         # =================================================
-        # 18. 반대방향 화살표
+        # 17. 반대 방향 화살표
         #
-        # 반대 화살표가 보이면:
-        # STOP -> RIGHT TURN
+        # 보이면:
+        # 정지 -> 오른쪽 회전
         # =================================================
         elif state == DRIVE_TO_REVERSE_ARROW:
 
-            if event == "rise":
+            if event == "RISE":
 
                 print(
-                    "REVERSE ARROW FOUND"
+                    "\nREVERSE ARROW FOUND"
                 )
 
                 print(
                     "STOP -> RIGHT TURN"
                 )
+
 
                 change_state(
                     TURN_TO_NORMAL_ARROW
@@ -658,20 +656,23 @@ try:
 
 
         # =================================================
-        # 19. 오른쪽으로 돌다가
-        # 정상 화살표가 보이면 회전 종료 후 직진
+        # 18. 오른쪽으로 회전하다
+        # 정상 화살표가 보이면:
+        #
+        # 정지 -> 직진
         # =================================================
         elif state == TURN_TO_NORMAL_ARROW:
 
-            if event == "rise":
+            if event == "RISE":
 
                 print(
-                    "NORMAL ARROW FOUND"
+                    "\nNORMAL ARROW FOUND"
                 )
 
                 print(
                     "STOP TURN -> FINAL STRAIGHT"
                 )
+
 
                 change_state(
                     DRIVE_TO_GOAL
@@ -679,49 +680,33 @@ try:
 
 
         # =================================================
-        # 20. GOAL
-        #
-        # GOAL 글씨가 보이면 최종 정지
+        # 19. GOAL 글씨까지 직진
         # =================================================
         elif state == DRIVE_TO_GOAL:
 
-            if event == "rise":
+            if event == "RISE":
 
                 print(
-                    "GOAL FOUND"
+                    "\nGOAL FOUND"
                 )
+
 
                 change_state(
                     DONE
                 )
 
 
-        time.sleep(0.01)
-
-
 except KeyboardInterrupt:
 
-    print("")
-    print("KeyboardInterrupt -> STOP")
+    print(
+        "\nUSER STOP"
+    )
 
 
 finally:
 
-    full_stop()
+    stop()
 
-    try:
-        motor.disable_motor()
-    except Exception:
-        pass
-
-    try:
-        motor.close()
-    except Exception:
-        pass
-
-    try:
-        camera.close()
-    except Exception:
-        pass
-
-    print("PROGRAM END")
+    print(
+        "\nPROGRAM END"
+    )
