@@ -1,712 +1,732 @@
-# =========================================================
-# 주행 로직 전용 코드
-#
-# 전제:
-#   - Raspberry Pi 환경/카메라/모터는 이미 구현되어 있음
-#   - 아래 객체/함수는 기존 코드에 이미 존재한다고 가정
-#
-#       cap.read()          -> ret, frame
-#       drive(left, right)  -> 모터 구동
-#       stop()              -> 정지
-#
-# 이 코드에서는 pinkylib / HOST / requests / 서버 설정을 만들지 않음.
-# =========================================================
-
 import cv2
 import numpy as np
+import requests
 import time
 
+# =========================================================
+# 기존에 잘 실행되던 Pinky 환경 그대로 사용
+# - 새 서버 X
+# - 새 라이브러리 X
+# - 외부 이미지 파일 X
+# =========================================================
+HOST = "http://192.168.4.1:8000"
 
 # =========================================================
-# 1. 주행 설정
+# 주행 설정
 # =========================================================
-DRIVE_SPEED = 23
+DRIVE_SPEED = 25
 TURN_SPEED = 22
-
-# "멈춘 다음 회전/출발"을 확실히 하기 위한 짧은 대기
-STOP_PAUSE = 0.35
-
-# 상태가 바뀐 직후 이전 표식을 다시 잡는 것 방지
+STOP_PAUSE = 0.30
 STATE_IGNORE_TIME = 0.60
 
-# Raspberry Pi 부하 감소:
-# 2프레임마다 한 번만 표식 확인
-DETECT_EVERY_N_FRAMES = 2
+# =========================================================
+# 영상 처리 설정
+# 기존 파일에서 쓰던 HSV/ROI 값 그대로 사용
+# =========================================================
+ROI_START_RATIO = 0.58
 
+LOWER_WHITE = np.array([0, 0, 175])
+UPPER_WHITE = np.array([180, 75, 255])
+LOWER_BLACK = np.array([0, 0, 0])
+UPPER_BLACK = np.array([180, 255, 80])
+
+MIN_AREA = 500
+MIN_WIDTH = 25
+ARROW_FILL_GAP_RATIO = 0.38
+ARROW_MIN_AREA = 700
+
+ARROW_CONFIRM_FRAMES = 3
+ARROW_GONE_FRAMES = 4
+TEXT_CONFIRM_FRAMES = 3
+
+# 글자 덩어리 검출 기준
+TEXT_MIN_AREA = 25
+TEXT_MAX_AREA = 5000
+STOP_MIN_PARTS = 3
+STATION_MIN_PARTS = 4
+GOAL_MIN_PARTS = 3
 
 # =========================================================
-# 2. 표식 인식 설정
-#
-# 가장 단순한 OpenCV template matching 사용.
-# 복잡한 YOLO/OCR 없음.
-#
-# 이 코드 파일과 같은 폴더 또는 아래 경로에
-# 다음 이미지가 있어야 함.
-#
-#   arrow_normal.png
-#   arrow_reverse.png
-#   stop.png
-#   station.png
-#   goal.png
-#
-# 실제 로봇 카메라 화면에서 해당 표식만 잘라 저장하면 됨.
+# 상태
 # =========================================================
-TEMPLATE_PATHS = {
-    "ARROW_NORMAL": "arrow_normal.png",
-    "ARROW_REVERSE": "arrow_reverse.png",
-    "STOP": "stop.png",
-    "STATION": "station.png",
-    "GOAL": "goal.png",
-}
-
-MATCH_THRESHOLD = {
-    "ARROW_NORMAL": 0.68,
-    "ARROW_REVERSE": 0.68,
-    "STOP": 0.68,
-    "STATION": 0.68,
-    "GOAL": 0.68,
-}
-
-# 한 프레임만 우연히 잡힌 것은 무시
-ON_FRAMES = 3
-
-# 화면에서 사라졌다고 판단할 연속 미검출 프레임 수
-OFF_FRAMES = 4
-
-
-# =========================================================
-# 3. 템플릿 불러오기
-# =========================================================
-templates = {}
-
-for name, path in TEMPLATE_PATHS.items():
-
-    img = cv2.imread(
-        path,
-        cv2.IMREAD_GRAYSCALE
-    )
-
-    if img is None:
-        raise FileNotFoundError(
-            f"{path} 파일을 찾을 수 없습니다."
-        )
-
-    templates[name] = img
-
-
-# =========================================================
-# 4. 가벼운 표식 인식
-#
-# 현재 상태에서 필요한 표식 1개만 검사함.
-# 크기가 약간 달라져도 잡도록 3개 scale만 확인.
-# =========================================================
-def template_score(frame, template):
-
-    gray = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    # 연산량 감소
-    h, w = gray.shape[:2]
-
-    if w > 640:
-        scale_down = 640.0 / w
-
-        gray = cv2.resize(
-            gray,
-            None,
-            fx=scale_down,
-            fy=scale_down
-        )
-
-    best_score = 0.0
-
-    for scale in (0.80, 1.00, 1.20):
-
-        resized_template = cv2.resize(
-            template,
-            None,
-            fx=scale,
-            fy=scale
-        )
-
-        th, tw = resized_template.shape[:2]
-        fh, fw = gray.shape[:2]
-
-        if (
-            th < 8
-            or tw < 8
-            or th >= fh
-            or tw >= fw
-        ):
-            continue
-
-        result = cv2.matchTemplate(
-            gray,
-            resized_template,
-            cv2.TM_CCOEFF_NORMED
-        )
-
-        _, score, _, _ = cv2.minMaxLoc(
-            result
-        )
-
-        if score > best_score:
-            best_score = float(score)
-
-    return best_score
-
-
-# =========================================================
-# 5. 표식이 실제로 등장/사라졌는지 안정적으로 확인
-# =========================================================
-class StableDetector:
-
-    def __init__(self):
-
-        self.active = False
-
-        self.on_count = 0
-        self.off_count = 0
-
-
-    def reset(self):
-
-        self.active = False
-
-        self.on_count = 0
-        self.off_count = 0
-
-
-    def update(self, detected):
-
-        # ---------------------------------------------
-        # 표식이 보임
-        # ---------------------------------------------
-        if detected:
-
-            self.on_count += 1
-            self.off_count = 0
-
-            if (
-                not self.active
-                and self.on_count >= ON_FRAMES
-            ):
-
-                self.active = True
-
-                return "RISE"
-
-
-        # ---------------------------------------------
-        # 표식이 안 보임
-        # ---------------------------------------------
-        else:
-
-            self.off_count += 1
-            self.on_count = 0
-
-            if (
-                self.active
-                and self.off_count >= OFF_FRAMES
-            ):
-
-                self.active = False
-
-                return "FALL"
-
-
-        return None
-
-
-detector = StableDetector()
-
-
-# =========================================================
-# 6. 상태 정의
-# =========================================================
-
-# 처음 직진하면서 정상 화살표 두 개 확인
 FIRST_STRAIGHT = "FIRST_STRAIGHT"
-
-# 두 번째 화살표가 사라진 뒤 우회전하며 STOP 찾기
 TURN_TO_FIRST_STOP = "TURN_TO_FIRST_STOP"
-
-# STOP 이후 직진, 다음 화살표 찾기
 DRIVE_TO_STATION_ARROW = "DRIVE_TO_STATION_ARROW"
-
-# 화살표에서 멈춘 뒤 우회전하며 STATION 찾기
 TURN_TO_STATION = "TURN_TO_STATION"
-
-# STATION 이후 직진, 다음 화살표 찾기
-DRIVE_TO_STOP_ARROW = "DRIVE_TO_STOP_ARROW"
-
-# 화살표에서 멈춘 뒤 우회전하며 STOP 찾기
+DRIVE_TO_SECOND_STOP_ARROW = "DRIVE_TO_SECOND_STOP_ARROW"
 TURN_TO_SECOND_STOP = "TURN_TO_SECOND_STOP"
-
-# STOP 이후 직진하며 반대방향 화살표 찾기
 DRIVE_TO_REVERSE_ARROW = "DRIVE_TO_REVERSE_ARROW"
-
-# 반대방향 화살표에서 우회전하며 정상 화살표 찾기
 TURN_TO_NORMAL_ARROW = "TURN_TO_NORMAL_ARROW"
-
-# 마지막 정상 화살표 이후 GOAL까지 직진
 DRIVE_TO_GOAL = "DRIVE_TO_GOAL"
-
 DONE = "DONE"
 
-
-# =========================================================
-# 7. 상태별로 찾아야 하는 표식
-# =========================================================
-def target_for_state(state):
-
-    if state == FIRST_STRAIGHT:
-        return "ARROW_NORMAL"
-
-    if state == TURN_TO_FIRST_STOP:
-        return "STOP"
-
-    if state == DRIVE_TO_STATION_ARROW:
-        return "ARROW_NORMAL"
-
-    if state == TURN_TO_STATION:
-        return "STATION"
-
-    if state == DRIVE_TO_STOP_ARROW:
-        return "ARROW_NORMAL"
-
-    if state == TURN_TO_SECOND_STOP:
-        return "STOP"
-
-    if state == DRIVE_TO_REVERSE_ARROW:
-        return "ARROW_REVERSE"
-
-    if state == TURN_TO_NORMAL_ARROW:
-        return "ARROW_NORMAL"
-
-    if state == DRIVE_TO_GOAL:
-        return "GOAL"
-
-    return None
-
-
-# =========================================================
-# 8. 주행 상태 변수
-# =========================================================
 state = FIRST_STRAIGHT
-
-state_changed_time = time.monotonic()
+auto_mode = False
+state_start_time = 0.0
 
 arrow_count = 0
-second_arrow_seen = False
+normal_arrow_direction = None
+reverse_arrow_direction = None
 
-frame_count = 0
+on_counter = 0
+off_counter = 0
+detect_locked = False
 
 
 # =========================================================
-# 9. 반드시 "멈춘 뒤" 상태 변경
+# 모터 제어 - 기존 파일 그대로
+# =========================================================
+def drive(left, right):
+    left = int(np.clip(left, -100, 100))
+    right = int(np.clip(right, -100, 100))
+
+    try:
+        requests.post(
+            HOST + "/drive",
+            json={"l": left, "r": right},
+            timeout=0.3
+        )
+    except requests.RequestException:
+        pass
+
+
+def stop():
+    try:
+        requests.post(
+            HOST + "/stop",
+            timeout=0.3
+        )
+    except requests.RequestException:
+        pass
+
+
+# =========================================================
+# 기본 영상 처리
+# =========================================================
+def remove_small_components(mask, min_area):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    cleaned = np.zeros_like(mask)
+
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+
+    return cleaned
+
+
+def fill_arrow_gaps(white_mask):
+    filled = white_mask.copy()
+    h, w = white_mask.shape
+    max_gap = int(w * ARROW_FILL_GAP_RATIO)
+
+    for y in range(h):
+        xs = np.where(white_mask[y] == 255)[0]
+        if len(xs) == 0:
+            continue
+
+        groups = np.split(xs, np.where(np.diff(xs) > 1)[0] + 1)
+        groups = [g for g in groups if len(g) >= MIN_WIDTH]
+
+        for i in range(len(groups) - 1):
+            left_end = int(groups[i][-1])
+            right_start = int(groups[i + 1][0])
+            gap = right_start - left_end - 1
+
+            if 0 < gap <= max_gap:
+                filled[y, left_end:right_start + 1] = 255
+
+    return cv2.morphologyEx(
+        filled,
+        cv2.MORPH_CLOSE,
+        np.ones((3, 5), np.uint8),
+        iterations=1
+    )
+
+
+# =========================================================
+# 화살표 방향 판별
+# 첫 화살표 방향을 "정상 방향"으로 자동 기억
+# =========================================================
+def classify_arrow_direction(crop):
+    h, w = crop.shape
+
+    if h < 12 or w < 8:
+        return "UNKNOWN"
+
+    widths = np.count_nonzero(crop, axis=1).astype(np.float32)
+    zone = max(2, int(h * 0.32))
+
+    top = float(np.mean(widths[:zone]))
+    bottom = float(np.mean(widths[-zone:]))
+
+    if top > bottom * 1.15:
+        return "UP"
+
+    if bottom > top * 1.15:
+        return "DOWN"
+
+    return "UNKNOWN"
+
+
+def opposite_direction(direction):
+    if direction == "UP":
+        return "DOWN"
+    if direction == "DOWN":
+        return "UP"
+    return "UNKNOWN"
+
+
+# =========================================================
+# 기존 코드의 검은색 contour 방식으로 화살표 검출
+# 외부 이미지/모델 없음
+# =========================================================
+def detect_arrow(hsv, road_mask):
+    black_mask = cv2.inRange(hsv, LOWER_BLACK, UPPER_BLACK)
+    arrow_mask = cv2.bitwise_and(black_mask, road_mask)
+
+    arrow_mask = cv2.morphologyEx(
+        arrow_mask,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    contours, _ = cv2.findContours(
+        arrow_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    best_area = 0.0
+    best_direction = "UNKNOWN"
+    best_box = None
+    _, roi_w = arrow_mask.shape
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < ARROW_MIN_AREA:
+            continue
+
+        x, y, cw, ch = cv2.boundingRect(contour)
+        center_x = x + cw // 2
+
+        if center_x < int(roi_w * 0.15) or center_x > int(roi_w * 0.85):
+            continue
+
+        # 가로로 너무 긴 것은 글씨/경계일 가능성이 높음
+        if cw > ch * 3.0:
+            continue
+
+        if area > best_area:
+            crop = arrow_mask[y:y + ch, x:x + cw]
+            best_area = area
+            best_direction = classify_arrow_direction(crop)
+            best_box = (x, y, cw, ch)
+
+    return (
+        best_box is not None,
+        best_direction,
+        arrow_mask,
+        best_area,
+        best_box
+    )
+
+
+# =========================================================
+# STOP / STATION / GOAL 검출
+# OCR을 새로 설치하지 않는다.
+# 여러 검은 글자 조각이 한 줄에 나타나는지만 본다.
+# 어떤 단어인지는 현재 상태 순서로 판단한다.
+# =========================================================
+def detect_text_sign(hsv, min_parts):
+    black_mask = cv2.inRange(hsv, LOWER_BLACK, UPPER_BLACK)
+    roi_h, roi_w = black_mask.shape
+
+    focus = np.zeros_like(black_mask)
+    x1 = int(roi_w * 0.10)
+    x2 = int(roi_w * 0.90)
+    focus[:, x1:x2] = black_mask[:, x1:x2]
+
+    focus = cv2.morphologyEx(
+        focus,
+        cv2.MORPH_OPEN,
+        np.ones((2, 2), np.uint8),
+        iterations=1
+    )
+
+    contours, _ = cv2.findContours(
+        focus,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    parts = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < TEXT_MIN_AREA or area > TEXT_MAX_AREA:
+            continue
+
+        x, y, cw, ch = cv2.boundingRect(contour)
+
+        if ch < 7 or ch > int(roi_h * 0.45):
+            continue
+        if cw < 3 or cw > int(roi_w * 0.30):
+            continue
+
+        parts.append({
+            "x": x,
+            "y": y,
+            "w": cw,
+            "h": ch,
+            "cy": y + ch / 2.0
+        })
+
+    # 같은 높이에 있는 글자들을 한 단어 후보로 묶기
+    best_group = []
+    y_tol = roi_h * 0.12
+
+    for base in parts:
+        group = [p for p in parts if abs(p["cy"] - base["cy"]) <= y_tol]
+        if len(group) > len(best_group):
+            best_group = group
+
+    found = False
+    box = None
+
+    if len(best_group) >= min_parts:
+        min_x = min(p["x"] for p in best_group)
+        max_x = max(p["x"] + p["w"] for p in best_group)
+        min_y = min(p["y"] for p in best_group)
+        max_y = max(p["y"] + p["h"] for p in best_group)
+
+        if (max_x - min_x) >= int(roi_w * 0.10):
+            found = True
+            box = (min_x, min_y, max_x - min_x, max_y - min_y)
+
+    return found, focus, len(best_group), box
+
+
+# =========================================================
+# 연속 프레임 확인
+# =========================================================
+def reset_detection():
+    global on_counter, off_counter, detect_locked
+    on_counter = 0
+    off_counter = 0
+    detect_locked = False
+
+
+def update_detection(found, confirm_frames, gone_frames=ARROW_GONE_FRAMES):
+    global on_counter, off_counter, detect_locked
+
+    rise = False
+    fall = False
+
+    if found:
+        off_counter = 0
+
+        if not detect_locked:
+            on_counter += 1
+
+            if on_counter >= confirm_frames:
+                detect_locked = True
+                on_counter = 0
+                rise = True
+
+    else:
+        on_counter = 0
+
+        if detect_locked:
+            off_counter += 1
+
+            if off_counter >= gone_frames:
+                detect_locked = False
+                off_counter = 0
+                fall = True
+
+    return rise, fall
+
+
+# =========================================================
+# 상태 변경
+# 항상 먼저 정지한 뒤 다음 상태로 감
 # =========================================================
 def change_state(new_state):
+    global state, state_start_time
 
-    global state
-    global state_changed_time
-
-    # ★ 핵심: 먼저 정지
     stop()
-
-    time.sleep(
-        STOP_PAUSE
-    )
+    time.sleep(STOP_PAUSE)
 
     state = new_state
+    state_start_time = time.monotonic()
+    reset_detection()
 
-    state_changed_time = (
-        time.monotonic()
-    )
-
-    detector.reset()
-
-    print(
-        f"STATE -> {state}"
-    )
+    print(f"STATE -> {state}")
 
 
 # =========================================================
-# 10. 자율주행 시작
+# 카메라 - 기존 파일 그대로
 # =========================================================
-print("")
-print("==============================")
-print("AUTONOMOUS ROUTE START")
-print("==============================")
+cap = cv2.VideoCapture(HOST + "/video")
+
+if not cap.isOpened():
+    print("카메라 연결 실패")
+    raise SystemExit
 
 
-try:
+print("""
+=================================================
+Pinky Pro - Simple Route
+=================================================
+P       : AUTO ON/OFF
+W/S/A/D : 수동
+SPACE   : 정지
+R       : 초기화
+ESC     : 종료
 
-    while True:
-
-        # =================================================
-        # 카메라 프레임
-        # =================================================
-        ret, frame = cap.read()
-
-        if not ret:
-
-            stop()
-
-            print(
-                "CAMERA FRAME ERROR"
-            )
-
-            time.sleep(0.05)
-
-            continue
-
-
-        # =================================================
-        # A. 현재 상태에 따른 기본 모터 동작
-        # =================================================
-
-        # ---------------------------------------------
-        # 직진 상태
-        # ---------------------------------------------
-        if state in (
-            FIRST_STRAIGHT,
-            DRIVE_TO_STATION_ARROW,
-            DRIVE_TO_STOP_ARROW,
-            DRIVE_TO_REVERSE_ARROW,
-            DRIVE_TO_GOAL
-        ):
-
-            drive(
-                DRIVE_SPEED,
-                DRIVE_SPEED
-            )
+AUTO 순서
+1) 직진
+2) 두 번째 화살표가 화면에서 사라짐 -> 정지 -> 우회전
+3) STOP 형태 보임 -> 정지 -> 직진
+4) 다음 화살표 -> 정지 -> 우회전
+5) STATION 형태 보임 -> 정지 -> 직진
+6) 다음 화살표 -> 정지 -> 우회전
+7) STOP 형태 보임 -> 정지 -> 직진
+8) 반대방향 화살표 -> 정지 -> 우회전
+9) 정상방향 화살표 -> 정지 -> 직진
+10) GOAL 형태 보임 -> 최종 정지
+=================================================
+""")
 
 
-        # ---------------------------------------------
-        # 오른쪽 회전 상태
-        # ---------------------------------------------
-        elif state in (
-            TURN_TO_FIRST_STOP,
-            TURN_TO_STATION,
-            TURN_TO_SECOND_STOP,
-            TURN_TO_NORMAL_ARROW
-        ):
+# =========================================================
+# 메인 루프
+# =========================================================
+while True:
+    ret, frame = cap.read()
 
-            drive(
-                TURN_SPEED,
-                -TURN_SPEED
-            )
+    if not ret:
+        print("영상 수신 실패")
+        stop()
+        break
 
+    h, w = frame.shape[:2]
+    roi_start = int(h * ROI_START_RATIO)
+    roi = frame[roi_start:h, :]
+    roi_h, roi_w = roi.shape[:2]
 
-        # ---------------------------------------------
-        # 도착
-        # ---------------------------------------------
-        elif state == DONE:
+    roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
+    hsv = cv2.cvtColor(roi_blur, cv2.COLOR_BGR2HSV)
 
-            stop()
+    # -----------------------------------------------------
+    # 흰 도로: 화살표가 도로 안에 있는지만 보기 위해 사용
+    # 중심선 추종에는 사용하지 않음
+    # -----------------------------------------------------
+    white_mask = cv2.inRange(hsv, LOWER_WHITE, UPPER_WHITE)
+    white_mask = cv2.morphologyEx(
+        white_mask,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+    white_mask = remove_small_components(white_mask, MIN_AREA)
+    road_mask = fill_arrow_gaps(white_mask)
 
-            print(
-                "GOAL COMPLETE"
-            )
+    # -----------------------------------------------------
+    # 화살표
+    # -----------------------------------------------------
+    (
+        arrow_found,
+        arrow_direction,
+        arrow_mask,
+        arrow_area,
+        arrow_box
+    ) = detect_arrow(hsv, road_mask)
 
-            break
+    # -----------------------------------------------------
+    # 글씨 표식
+    # -----------------------------------------------------
+    text_found = False
+    text_mask = np.zeros_like(white_mask)
+    text_parts = 0
+    text_box = None
 
-
-        # =================================================
-        # B. Raspberry Pi 연산량 줄이기
-        # =================================================
-        frame_count += 1
-
-        if (
-            frame_count
-            % DETECT_EVERY_N_FRAMES
-            != 0
-        ):
-
-            continue
-
-
-        # 상태가 막 바뀌었으면
-        # 이전 표식을 바로 다시 잡지 않도록 잠깐 무시
-        if (
-            time.monotonic()
-            - state_changed_time
-            < STATE_IGNORE_TIME
-        ):
-
-            continue
-
-
-        # =================================================
-        # C. 현재 필요한 표식 하나만 검사
-        # =================================================
-        target = target_for_state(
-            state
+    if state in (TURN_TO_FIRST_STOP, TURN_TO_SECOND_STOP):
+        text_found, text_mask, text_parts, text_box = detect_text_sign(
+            hsv,
+            STOP_MIN_PARTS
         )
 
-        if target is None:
-            continue
-
-
-        score = template_score(
-            frame,
-            templates[target]
+    elif state == TURN_TO_STATION:
+        text_found, text_mask, text_parts, text_box = detect_text_sign(
+            hsv,
+            STATION_MIN_PARTS
         )
 
-
-        detected = (
-            score
-            >= MATCH_THRESHOLD[target]
+    elif state == DRIVE_TO_GOAL:
+        text_found, text_mask, text_parts, text_box = detect_text_sign(
+            hsv,
+            GOAL_MIN_PARTS
         )
 
+    detection_enabled = (
+        time.monotonic() - state_start_time >= STATE_IGNORE_TIME
+    )
 
-        event = detector.update(
-            detected
-        )
+    # =====================================================
+    # AUTO
+    # =====================================================
+    if auto_mode:
 
-
-        # 필요하면 SSH 터미널에서 현재 값 확인 가능
-        print(
-            f"\r"
-            f"{state} | "
-            f"{target}: {score:.2f}",
-            end=""
-        )
-
-
-        # =================================================
-        # 11. 처음 직진
-        #
-        # 정상 화살표를 두 번 봄.
-        # 두 번째 화살표가 카메라에서 완전히 사라지면:
-        #
-        # STOP -> 우회전
-        # =================================================
+        # 1) 처음 직진, 화살표 2개 카운트
         if state == FIRST_STRAIGHT:
+            drive(DRIVE_SPEED, DRIVE_SPEED)
 
-            # 화살표 등장
-            if event == "RISE":
-
-                arrow_count += 1
-
-                print(
-                    f"\nARROW COUNT = "
-                    f"{arrow_count}"
+            if detection_enabled:
+                rise, fall = update_detection(
+                    arrow_found,
+                    ARROW_CONFIRM_FRAMES
                 )
 
+                if rise:
+                    arrow_count += 1
 
-                if arrow_count == 2:
+                    if arrow_direction != "UNKNOWN":
+                        normal_arrow_direction = arrow_direction
 
-                    second_arrow_seen = True
+                    print(f"ARROW COUNT = {arrow_count}")
+                    print(f"NORMAL DIR = {normal_arrow_direction}")
 
-                    print(
-                        "SECOND ARROW SEEN"
-                    )
+                # 핵심: 2번째 화살표가 화면에서 사라지면 즉시 정지 -> 우회전
+                if fall and arrow_count >= 2:
+                    print("ARROW 2 DISAPPEARED")
+                    print("STOP -> RIGHT TURN")
+                    change_state(TURN_TO_FIRST_STOP)
 
-
-            # 두 번째 화살표가 사라짐
-            elif (
-                event == "FALL"
-                and second_arrow_seen
-            ):
-
-                print(
-                    "\nSECOND ARROW DISAPPEARED"
-                )
-
-                print(
-                    "STOP -> RIGHT TURN"
-                )
-
-
-                change_state(
-                    TURN_TO_FIRST_STOP
-                )
-
-
-        # =================================================
-        # 12. 첫 번째 우회전
-        #
-        # STOP 글씨가 보일 때까지 회전.
-        #
-        # STOP이 보이면:
-        # 회전 정지 -> 직진
-        # =================================================
+        # 2) STOP이 보일 때까지 우회전
         elif state == TURN_TO_FIRST_STOP:
+            drive(TURN_SPEED, -TURN_SPEED)
 
-            if event == "RISE":
+            if detection_enabled:
+                rise, _ = update_detection(text_found, TEXT_CONFIRM_FRAMES)
+                if rise:
+                    print("STOP FOUND -> STRAIGHT")
+                    change_state(DRIVE_TO_STATION_ARROW)
 
-                print(
-                    "\nSTOP FOUND"
-                )
-
-
-                change_state(
-                    DRIVE_TO_STATION_ARROW
-                )
-
-
-        # =================================================
-        # 13. 다음 화살표
-        #
-        # 화살표가 보이면:
-        # 정지 -> 오른쪽 회전
-        # =================================================
+        # 3) 다음 화살표까지 직진
         elif state == DRIVE_TO_STATION_ARROW:
+            drive(DRIVE_SPEED, DRIVE_SPEED)
 
-            if event == "RISE":
+            if detection_enabled:
+                rise, _ = update_detection(arrow_found, ARROW_CONFIRM_FRAMES)
+                if rise:
+                    print("ARROW FOUND -> TURN TO STATION")
+                    change_state(TURN_TO_STATION)
 
-                print(
-                    "\nARROW FOUND"
-                )
-
-                print(
-                    "STOP -> TURN TO STATION"
-                )
-
-
-                change_state(
-                    TURN_TO_STATION
-                )
-
-
-        # =================================================
-        # 14. STATION 보일 때까지 회전
-        # =================================================
+        # 4) STATION이 보일 때까지 우회전
         elif state == TURN_TO_STATION:
+            drive(TURN_SPEED, -TURN_SPEED)
 
-            if event == "RISE":
+            if detection_enabled:
+                rise, _ = update_detection(text_found, TEXT_CONFIRM_FRAMES)
+                if rise:
+                    print("STATION FOUND -> STRAIGHT")
+                    change_state(DRIVE_TO_SECOND_STOP_ARROW)
 
-                print(
-                    "\nSTATION FOUND"
-                )
+        # 5) 다음 화살표까지 직진
+        elif state == DRIVE_TO_SECOND_STOP_ARROW:
+            drive(DRIVE_SPEED, DRIVE_SPEED)
 
+            if detection_enabled:
+                rise, _ = update_detection(arrow_found, ARROW_CONFIRM_FRAMES)
+                if rise:
+                    print("ARROW FOUND -> TURN TO STOP")
+                    change_state(TURN_TO_SECOND_STOP)
 
-                change_state(
-                    DRIVE_TO_STOP_ARROW
-                )
-
-
-        # =================================================
-        # 15. 다음 화살표
-        #
-        # 화살표가 보이면:
-        # 정지 -> 오른쪽 회전
-        # =================================================
-        elif state == DRIVE_TO_STOP_ARROW:
-
-            if event == "RISE":
-
-                print(
-                    "\nARROW FOUND"
-                )
-
-                print(
-                    "STOP -> TURN TO STOP SIGN"
-                )
-
-
-                change_state(
-                    TURN_TO_SECOND_STOP
-                )
-
-
-        # =================================================
-        # 16. STOP 글씨 보일 때까지 회전
-        # =================================================
+        # 6) STOP이 보일 때까지 우회전
         elif state == TURN_TO_SECOND_STOP:
+            drive(TURN_SPEED, -TURN_SPEED)
 
-            if event == "RISE":
+            if detection_enabled:
+                rise, _ = update_detection(text_found, TEXT_CONFIRM_FRAMES)
+                if rise:
+                    print("STOP FOUND -> STRAIGHT")
+                    change_state(DRIVE_TO_REVERSE_ARROW)
 
-                print(
-                    "\nSTOP FOUND"
-                )
-
-
-                change_state(
-                    DRIVE_TO_REVERSE_ARROW
-                )
-
-
-        # =================================================
-        # 17. 반대 방향 화살표
-        #
-        # 보이면:
-        # 정지 -> 오른쪽 회전
-        # =================================================
+        # 7) 반대방향 화살표까지 직진
         elif state == DRIVE_TO_REVERSE_ARROW:
+            drive(DRIVE_SPEED, DRIVE_SPEED)
 
-            if event == "RISE":
+            reverse_candidate = False
 
-                print(
-                    "\nREVERSE ARROW FOUND"
+            if arrow_found:
+                if normal_arrow_direction in ("UP", "DOWN"):
+                    reverse_candidate = (
+                        arrow_direction == opposite_direction(normal_arrow_direction)
+                    )
+                else:
+                    # 정상 방향 판별이 실패했을 경우 이 구간의 첫 화살표 사용
+                    reverse_candidate = True
+
+            if detection_enabled:
+                rise, _ = update_detection(
+                    reverse_candidate,
+                    ARROW_CONFIRM_FRAMES
                 )
 
-                print(
-                    "STOP -> RIGHT TURN"
-                )
+                if rise:
+                    if arrow_direction != "UNKNOWN":
+                        reverse_arrow_direction = arrow_direction
 
+                    print("REVERSE ARROW FOUND -> RIGHT TURN")
+                    change_state(TURN_TO_NORMAL_ARROW)
 
-                change_state(
-                    TURN_TO_NORMAL_ARROW
-                )
-
-
-        # =================================================
-        # 18. 오른쪽으로 회전하다
-        # 정상 화살표가 보이면:
-        #
-        # 정지 -> 직진
-        # =================================================
+        # 8) 정상방향 화살표가 보일 때까지 우회전
         elif state == TURN_TO_NORMAL_ARROW:
+            drive(TURN_SPEED, -TURN_SPEED)
 
-            if event == "RISE":
+            normal_candidate = False
 
-                print(
-                    "\nNORMAL ARROW FOUND"
+            if arrow_found:
+                if normal_arrow_direction in ("UP", "DOWN"):
+                    normal_candidate = (
+                        arrow_direction == normal_arrow_direction
+                    )
+                elif reverse_arrow_direction in ("UP", "DOWN"):
+                    normal_candidate = (
+                        arrow_direction == opposite_direction(reverse_arrow_direction)
+                    )
+                else:
+                    normal_candidate = True
+
+            if detection_enabled:
+                rise, _ = update_detection(
+                    normal_candidate,
+                    ARROW_CONFIRM_FRAMES
                 )
 
-                print(
-                    "STOP TURN -> FINAL STRAIGHT"
-                )
+                if rise:
+                    print("NORMAL ARROW FOUND -> FINAL STRAIGHT")
+                    change_state(DRIVE_TO_GOAL)
 
-
-                change_state(
-                    DRIVE_TO_GOAL
-                )
-
-
-        # =================================================
-        # 19. GOAL 글씨까지 직진
-        # =================================================
+        # 9) GOAL까지 직진
         elif state == DRIVE_TO_GOAL:
+            drive(DRIVE_SPEED, DRIVE_SPEED)
 
-            if event == "RISE":
+            if detection_enabled:
+                rise, _ = update_detection(text_found, TEXT_CONFIRM_FRAMES)
+                if rise:
+                    print("GOAL FOUND")
+                    change_state(DONE)
 
-                print(
-                    "\nGOAL FOUND"
-                )
+        elif state == DONE:
+            stop()
+            auto_mode = False
+            print("GOAL COMPLETE -> AUTO OFF")
 
+    # =====================================================
+    # 화면 표시
+    # =====================================================
+    result = frame.copy()
 
-                change_state(
-                    DONE
-                )
-
-
-except KeyboardInterrupt:
-
-    print(
-        "\nUSER STOP"
+    cv2.line(
+        result,
+        (0, roi_start),
+        (w, roi_start),
+        (0, 255, 255),
+        2
     )
 
+    if arrow_box is not None:
+        x, y, cw, ch = arrow_box
+        cv2.rectangle(
+            result,
+            (x, y + roi_start),
+            (x + cw, y + ch + roi_start),
+            (0, 255, 0),
+            2
+        )
 
-finally:
+    if text_box is not None:
+        x, y, cw, ch = text_box
+        cv2.rectangle(
+            result,
+            (x, y + roi_start),
+            (x + cw, y + ch + roi_start),
+            (0, 0, 255),
+            2
+        )
 
-    stop()
+    mode_text = "AUTO" if auto_mode else "MANUAL"
 
-    print(
-        "\nPROGRAM END"
-    )
+    cv2.putText(result, f"MODE: {mode_text}", (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
+    cv2.putText(result, f"STATE: {state}", (20, 58),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 0, 0), 2)
+    cv2.putText(result, f"ARROW COUNT: {arrow_count}", (20, 86),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 0), 2)
+    cv2.putText(result, f"ARROW DIR: {arrow_direction}", (20, 114),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 0), 2)
+    cv2.putText(result, f"NORMAL DIR: {normal_arrow_direction}", (20, 142),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 0), 2)
+    cv2.putText(result, f"TEXT PARTS: {text_parts}", (20, 170),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 0), 2)
+
+    cv2.imshow("Pinky Main", result)
+    cv2.imshow("Arrow Mask", arrow_mask)
+    cv2.imshow("Text Mask", text_mask)
+
+    # =====================================================
+    # 키보드 - 기존 방식 유지
+    # =====================================================
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("p"):
+        auto_mode = not auto_mode
+        stop()
+        state_start_time = time.monotonic()
+        reset_detection()
+        print("AUTO ON" if auto_mode else "AUTO OFF")
+
+    elif key == ord("w"):
+        auto_mode = False
+        drive(30, 30)
+
+    elif key == ord("s"):
+        auto_mode = False
+        drive(-30, -30)
+
+    elif key == ord("a"):
+        auto_mode = False
+        drive(-25, 25)
+
+    elif key == ord("d"):
+        auto_mode = False
+        drive(25, -25)
+
+    elif key == 32:
+        auto_mode = False
+        stop()
+        print("STOP")
+
+    elif key == ord("r"):
+        auto_mode = False
+        state = FIRST_STRAIGHT
+        state_start_time = 0.0
+        arrow_count = 0
+        normal_arrow_direction = None
+        reverse_arrow_direction = None
+        reset_detection()
+        stop()
+        print("RESET")
+
+    elif key == 27:
+        stop()
+        break
+
+
+stop()
+cap.release()
+cv2.destroyAllWindows()
+print("종료")
